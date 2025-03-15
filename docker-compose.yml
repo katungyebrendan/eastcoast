@@ -1,0 +1,10 @@
+version: '3'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./balanced_dataset.csv:/app/balanced_dataset.csv
+    restart: unless-stopped
