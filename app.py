@@ -257,11 +257,24 @@ async def root():
 @app.post("/predict/")
 async def predict(data: PredictionRequest):
     try:
+        # Get the input features
+        features = data.features
+        
+        # Handle the case where the input has fewer features than expected (needs 8 features)
+        if len(features) < input_dim:
+            logger.warning(f"Input has {len(features)} features, but model expects {input_dim}. Padding with zeros.")
+            features_padded = features + [0] * (input_dim - len(features))
+        else:
+            features_padded = features[:input_dim]
+        
+        # Apply scaling if scaler is available
+        if scaler is not None:
+            features_padded = scaler.transform([features_padded])[0]
+            
         # Convert input to tensor
-        X = torch.tensor(data.features, dtype=torch.float).view(1, -1)
+        X = torch.tensor([features_padded], dtype=torch.float)
         
         # Create self-loop for the single node since we need some edge structure
-        # This fixes the "index out of bounds" error by ensuring we have valid edges
         edge_index = torch.tensor([[0, 0], [0, 0]], dtype=torch.long)
         
         # Make prediction with student model (smaller and faster)
