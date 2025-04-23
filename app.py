@@ -15,6 +15,7 @@ import logging
 from sklearn.cluster import KMeans
 from imblearn.over_sampling import SMOTE
 import networkx as nx
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -26,7 +27,7 @@ app = FastAPI(title="ECF Prediction Model")
 # Define request model
 class PredictionRequest(BaseModel):
     features: List[float]
-    edges: List[List[int]]
+    edges: List[List[int]] = []  # Optional edges
 
 # Define Teacher Model (Larger GNN)
 class TeacherGNN(torch.nn.Module):
@@ -42,7 +43,7 @@ class TeacherGNN(torch.nn.Module):
         x = self.conv3(x, edge_index)
         return F.log_softmax(x, dim=1)
 
-# Define Student Model
+# Define Student Model (Smaller GNN)
 class StudentGNN(torch.nn.Module):
     def __init__(self, in_channels, hidden_channels, out_channels):
         super(StudentGNN, self).__init__()
@@ -70,8 +71,8 @@ def load_and_preprocess_data():
         df = pd.read_csv('balanced_dataset.csv')
         logger.info(f"Loaded dataset with {len(df)} samples")
         
-        # Select features (excluding name, target and spatial identifiers)
-        feature_cols = ['genotype', 'longitude', 'latitude', 'tick', 'cape', 'cattle', 'bio5']
+        # Select features (using only those specified in the second code sample)
+        feature_cols = ['tick', 'cape', 'cattle', 'bio5']
         X = df[feature_cols].values
         y = df['ECF'].values
         
@@ -80,7 +81,7 @@ def load_and_preprocess_data():
         X_resampled, y_resampled = smote.fit_resample(X, y)
         logger.info(f"After SMOTE: {len(X_resampled)} samples")
         
-        # Apply K-Means clustering
+        # Apply K-Means clustering with exactly 3 clusters
         kmeans = KMeans(n_clusters=3, random_state=42)
         clusters = kmeans.fit_predict(X_resampled)
         
@@ -99,14 +100,14 @@ def load_and_preprocess_data():
         # Update feature columns to include cluster
         feature_cols.append('cluster')
         
-        return X_train, X_test, y_train, y_test, scaler, feature_cols
+        return X_train, X_test, y_train, y_test, scaler, feature_cols, kmeans
     
     except Exception as e:
         logger.error(f"Error loading data: {e}")
         raise
 
 def create_graph_data(X, y=None):
-    """Create a graph from feature data using Erdős-Rényi model"""
+    """Create a graph from feature data using Erdős-Rényi model with p=0.1"""
     num_nodes = X.shape[0]
     
     # Create Erdős-Rényi graph with probability p=0.1
@@ -140,6 +141,23 @@ def train_teacher_model(teacher_model, data, device, epochs=100):
         if (epoch+1) % 10 == 0:
             logger.info(f'Teacher Model - Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}')
     
+    # Evaluate teacher model
+    teacher_model.eval()
+    with torch.no_grad():
+        teacher_out = teacher_model(data.x, data.edge_index)
+        teacher_preds = teacher_out.argmax(dim=1)
+    
+    # Calculate metrics
+    teacher_true_labels = data.y.cpu().numpy()
+    teacher_pred_labels = teacher_preds.cpu().numpy()
+    
+    teacher_accuracy = accuracy_score(teacher_true_labels, teacher_pred_labels)
+    teacher_precision = precision_score(teacher_true_labels, teacher_pred_labels, average='weighted')
+    teacher_recall = recall_score(teacher_true_labels, teacher_pred_labels, average='weighted')
+    teacher_f1 = f1_score(teacher_true_labels, teacher_pred_labels, average='weighted')
+    
+    logger.info(f"Teacher Model Metrics - Accuracy: {teacher_accuracy:.4f}, Precision: {teacher_precision:.4f}, Recall: {teacher_recall:.4f}, F1: {teacher_f1:.4f}")
+    
     return teacher_model
 
 def train_student_with_distillation(teacher_model, student_model, data, device, epochs=100):
@@ -163,40 +181,49 @@ def train_student_with_distillation(teacher_model, student_model, data, device, 
         if (epoch+1) % 10 == 0:
             logger.info(f'Student Model - Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}')
     
-    return student_model
-
-def evaluate_model(model, data, device):
-    """Evaluate the model"""
-    model.eval()
+    # Evaluate student model
+    student_model.eval()
     with torch.no_grad():
-        out = model(data.x, data.edge_index)
-        pred = out.argmax(dim=1)
-        correct = pred.eq(data.y).sum().item()
-        acc = correct / data.y.size(0)
-    return acc
+        student_out = student_model(data.x, data.edge_index)
+        student_preds = student_out.argmax(dim=1)
+    
+    # Calculate metrics
+    student_true_labels = data.y.cpu().numpy()
+    student_pred_labels = student_preds.cpu().numpy()
+    
+    student_accuracy = accuracy_score(student_true_labels, student_pred_labels)
+    student_precision = precision_score(student_true_labels, student_pred_labels, average='weighted')
+    student_recall = recall_score(student_true_labels, student_pred_labels, average='weighted')
+    student_f1 = f1_score(student_true_labels, student_pred_labels, average='weighted')
+    
+    logger.info(f"Student Model Metrics - Accuracy: {student_accuracy:.4f}, Precision: {student_precision:.4f}, Recall: {student_recall:.4f}, F1: {student_f1:.4f}")
+    
+    return student_model
 
 # Initialize models
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger.info(f"Using device: {device}")
-
-input_dim = 8  # Number of features (7 original + 1 cluster)
-teacher_hidden_dim = 64
-student_hidden_dim = 32
-output_dim = 2  # Binary classification
-
-# Initialize models
-teacher_model = TeacherGNN(input_dim, teacher_hidden_dim, output_dim).to(device)
-student_model = StudentGNN(input_dim, student_hidden_dim, output_dim).to(device)
 
 # Model paths
 teacher_model_path = "teacher_model.pth"
 student_model_path = "student_model.pth"
 scaler = None
 feature_cols = []
+kmeans_model = None
+input_dim = 5  # 4 features + 1 cluster feature
+
+# Initialize models with dimensions matching the second code
+teacher_hidden_dim = 64
+student_hidden_dim = 32
+output_dim = 2  # Binary classification
+
+# Initialize models with proper dimensions
+teacher_model = TeacherGNN(input_dim, teacher_hidden_dim, output_dim).to(device)
+student_model = StudentGNN(input_dim, student_hidden_dim, output_dim).to(device)
 
 @app.on_event("startup")
 async def startup_event():
-    global teacher_model, student_model, scaler, feature_cols
+    global teacher_model, student_model, scaler, feature_cols, kmeans_model
     
     try:
         # Check if the student model file exists
@@ -210,9 +237,10 @@ async def startup_event():
             metadata = torch.load("model_metadata.pt", map_location=device)
             scaler = metadata["scaler"]
             feature_cols = metadata["feature_cols"]
+            kmeans_model = metadata["kmeans_model"]
             logger.info(f"Loaded model metadata. Features: {feature_cols}")
             
-            # Also load teacher model if it exists (optional)
+            # Also load teacher model if it exists
             if os.path.exists(teacher_model_path):
                 teacher_state_dict = torch.load(teacher_model_path, map_location=device)
                 teacher_model.load_state_dict(teacher_state_dict)
@@ -220,88 +248,127 @@ async def startup_event():
         else:
             logger.info("Training new models with knowledge distillation...")
             # Load and preprocess data
-            X_train, X_test, y_train, y_test, scaler, feature_cols = load_and_preprocess_data()
+            X_train, X_test, y_train, y_test, scaler, feature_cols, kmeans_model = load_and_preprocess_data()
             
             # Create graph data
             train_data = create_graph_data(X_train, y_train).to(device)
             test_data = create_graph_data(X_test, y_test).to(device)
             
-            # Train teacher model
-            teacher_model = train_teacher_model(teacher_model, train_data, device)
-            teacher_acc = evaluate_model(teacher_model, test_data, device)
-            logger.info(f"Teacher model test accuracy: {teacher_acc:.4f}")
+            # Train teacher model exactly like in the second code
+            teacher_model = train_teacher_model(teacher_model, train_data, device, epochs=100)
             
             # Train student model with knowledge distillation
-            student_model = train_student_with_distillation(teacher_model, student_model, train_data, device)
-            student_acc = evaluate_model(student_model, test_data, device)
-            logger.info(f"Student model test accuracy: {student_acc:.4f}")
+            student_model = train_student_with_distillation(teacher_model, student_model, train_data, device, epochs=100)
             
             # Save models and metadata
             torch.save(teacher_model.state_dict(), teacher_model_path)
             torch.save(student_model.state_dict(), student_model_path)
             torch.save({
                 "scaler": scaler,
-                "feature_cols": feature_cols
+                "feature_cols": feature_cols,
+                "kmeans_model": kmeans_model
             }, "model_metadata.pt")
             logger.info("Models and metadata saved")
     
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         # Continue running the application even if model training fails
-        # This allows us to manually fix issues and restart later
 
 @app.get("/")
 async def root():
     return {"message": "ECF Prediction API with Knowledge Distillation", "status": "active"}
 
+@app.head("/")
+async def head_root():
+    """Handle HEAD requests to the root endpoint."""
+    # HEAD requests should return the same headers as GET but with no body
+    return {"message": "ECF Prediction API with Knowledge Distillation", "status": "active"}
+
+@app.post("/")
+async def post_root():
+    """Handle POST requests to the root endpoint."""
+    return {
+        "message": "ECF Prediction API with Knowledge Distillation", 
+        "status": "active",
+        "note": "For predictions, use the /predict/ endpoint with the required data format"
+    }
+
+@app.options("/")
+async def options_root():
+    """Handle OPTIONS requests to the root endpoint."""
+    from fastapi.responses import Response
+    response = Response()
+    response.headers["Allow"] = "GET, POST, HEAD, OPTIONS"
+    return response
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring."""
+    return {"status": "healthy"}
+
 @app.post("/predict/")
 async def predict(data: PredictionRequest):
     try:
-        # Get the input features
+        # Get the input features - expect exactly 4 features (tick, cape, cattle, bio5)
         features = data.features
         
-        # Handle the case where the input has fewer features than expected (needs 8 features)
-        if len(features) < input_dim:
-            logger.warning(f"Input has {len(features)} features, but model expects {input_dim}. Padding with zeros.")
-            features_padded = features + [0] * (input_dim - len(features))
+        if len(features) != 4:
+            logger.warning(f"Expected 4 features but received {len(features)}. Please provide [tick, cape, cattle, bio5]")
+            raise HTTPException(status_code=400, detail="Expected 4 features: [tick, cape, cattle, bio5]")
+        
+        # Apply clustering to get the 5th feature (cluster)
+        if kmeans_model is not None:
+            cluster = kmeans_model.predict([features])[0]
+            features_with_cluster = features + [cluster]
         else:
-            features_padded = features[:input_dim]
+            # If no kmeans model, use a default cluster (0)
+            features_with_cluster = features + [0]
         
         # Apply scaling if scaler is available
         if scaler is not None:
-            features_padded = scaler.transform([features_padded])[0]
+            features_scaled = scaler.transform([features_with_cluster])[0]
+        else:
+            features_scaled = features_with_cluster
             
         # Convert input to tensor
-        X = torch.tensor([features_padded], dtype=torch.float)
+        X = torch.tensor([features_scaled], dtype=torch.float).to(device)
         
-        # Create self-loop for the single node since we need some edge structure
-        edge_index = torch.tensor([[0, 0], [0, 0]], dtype=torch.long)
+        # Create edge structure - either use provided edges or create a self-loop
+        if data.edges and len(data.edges) > 0:
+            # Use provided edges
+            edges = data.edges
+            edge_list = torch.tensor(edges, dtype=torch.long).t().to(device)
+        else:
+            # Create self-loop for the single node
+            edge_list = torch.tensor([[0], [0]], dtype=torch.long).to(device)
         
         # Make prediction with student model (smaller and faster)
         student_model.eval()
         with torch.no_grad():
-            output = student_model(X, edge_index)
-            probabilities = torch.exp(output).numpy()[0]
-            prediction = output.argmax(dim=1).item()
+            student_output = student_model(X, edge_list)
+            student_probabilities = torch.exp(student_output).cpu().numpy()[0]
+            student_prediction = student_output.argmax(dim=1).item()
         
-        # Optionally also get teacher prediction for comparison
+        # Also get teacher prediction for comparison
         teacher_model.eval()
         with torch.no_grad():
-            teacher_output = teacher_model(X, edge_index)
-            teacher_probabilities = torch.exp(teacher_output).numpy()[0]
+            teacher_output = teacher_model(X, edge_list)
+            teacher_probabilities = torch.exp(teacher_output).cpu().numpy()[0]
             teacher_prediction = teacher_output.argmax(dim=1).item()
         
         return {
-            "prediction": int(prediction),  # 0 or 1
-            "probability": float(probabilities[prediction]),  # Probability of predicted class
+            "prediction": int(student_prediction),  # 0 or 1
+            "probability": float(student_probabilities[student_prediction]),
+            "risk_level": "High" if student_prediction == 1 else "Low",
             "class_probabilities": {
-                "class_0": float(probabilities[0]),
-                "class_1": float(probabilities[1])
+                "low_risk": float(student_probabilities[0]),
+                "high_risk": float(student_probabilities[1])
             },
+            "cluster": int(features_with_cluster[4]),
             "teacher_prediction": int(teacher_prediction),
             "teacher_probabilities": {
-                "class_0": float(teacher_probabilities[0]),
-                "class_1": float(teacher_probabilities[1])
+                "low_risk": float(teacher_probabilities[0]),
+                "high_risk": float(teacher_probabilities[1])
             }
         }
     except Exception as e:
@@ -327,7 +394,7 @@ async def model_info():
         },
         "trained": os.path.exists(student_model_path),
         "device": str(device),
-        "features": feature_cols if feature_cols else ["Not loaded yet"]
+        "features": feature_cols if feature_cols else ["tick", "cape", "cattle", "bio5", "cluster"]
     }
 
 # Run locally for testing
