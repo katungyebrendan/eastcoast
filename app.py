@@ -12,6 +12,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from torch_geometric.data import Data
 import logging
+import traceback
 from sklearn.cluster import KMeans
 from imblearn.over_sampling import SMOTE
 import networkx as nx
@@ -226,54 +227,92 @@ async def startup_event():
     global teacher_model, student_model, scaler, feature_cols, kmeans_model
     
     try:
+        logger.info("Starting up the ECF Prediction API...")
+        
         # Check if the student model file exists
         if os.path.exists(student_model_path) and os.path.exists("model_metadata.pt"):
-            logger.info("Loading existing models...")
-            # Load student model
-            student_state_dict = torch.load(student_model_path, map_location=device)
-            student_model.load_state_dict(student_state_dict)
-            
-            # Load metadata
-            metadata = torch.load("model_metadata.pt", map_location=device)
-            scaler = metadata["scaler"]
-            feature_cols = metadata["feature_cols"]
-            kmeans_model = metadata["kmeans_model"]
-            logger.info(f"Loaded model metadata. Features: {feature_cols}")
-            
-            # Also load teacher model if it exists
-            if os.path.exists(teacher_model_path):
-                teacher_state_dict = torch.load(teacher_model_path, map_location=device)
-                teacher_model.load_state_dict(teacher_state_dict)
-                logger.info("Loaded teacher model")
+            logger.info("Found existing model files. Loading models...")
+            try:
+                # Load student model
+                student_state_dict = torch.load(student_model_path, map_location=device)
+                student_model.load_state_dict(student_state_dict)
+                logger.info("Student model loaded successfully")
+                
+                # Load metadata
+                metadata = torch.load("model_metadata.pt", map_location=device)
+                scaler = metadata.get("scaler")
+                feature_cols = metadata.get("feature_cols", [])
+                kmeans_model = metadata.get("kmeans_model")
+                
+                if scaler is None:
+                    logger.warning("Scaler not found in metadata")
+                if not feature_cols:
+                    logger.warning("Feature columns not found in metadata")
+                if kmeans_model is None:
+                    logger.warning("KMeans model not found in metadata")
+                
+                logger.info(f"Loaded model metadata. Features: {feature_cols}")
+                
+                # Also load teacher model if it exists
+                if os.path.exists(teacher_model_path):
+                    teacher_state_dict = torch.load(teacher_model_path, map_location=device)
+                    teacher_model.load_state_dict(teacher_state_dict)
+                    logger.info("Teacher model loaded successfully")
+                else:
+                    logger.warning("Teacher model file not found")
+            except Exception as load_error:
+                logger.error(f"Error loading models: {load_error}")
+                # Fall back to training new models
+                logger.info("Falling back to training new models...")
         else:
-            logger.info("Training new models with knowledge distillation...")
-            # Load and preprocess data
-            X_train, X_test, y_train, y_test, scaler, feature_cols, kmeans_model = load_and_preprocess_data()
+            logger.info("No existing models found. Training new models with knowledge distillation...")
+        
+        # If models weren't loaded successfully, train new ones
+        if student_model is None or not hasattr(student_model, 'conv1'):
+            # Check if dataset exists
+            if not os.path.exists('balanced_dataset.csv'):
+                logger.error("Dataset file 'balanced_dataset.csv' not found! Cannot train models.")
+                # Continue with untrained models
+                return
             
-            # Create graph data
-            train_data = create_graph_data(X_train, y_train).to(device)
-            test_data = create_graph_data(X_test, y_test).to(device)
-            
-            # Train teacher model exactly like in the second code
-            teacher_model = train_teacher_model(teacher_model, train_data, device, epochs=100)
-            
-            # Train student model with knowledge distillation
-            student_model = train_student_with_distillation(teacher_model, student_model, train_data, device, epochs=100)
-            
-            # Save models and metadata
-            torch.save(teacher_model.state_dict(), teacher_model_path)
-            torch.save(student_model.state_dict(), student_model_path)
-            torch.save({
-                "scaler": scaler,
-                "feature_cols": feature_cols,
-                "kmeans_model": kmeans_model
-            }, "model_metadata.pt")
-            logger.info("Models and metadata saved")
+            try:
+                # Load and preprocess data
+                X_train, X_test, y_train, y_test, scaler, feature_cols, kmeans_model = load_and_preprocess_data()
+                logger.info(f"Data loaded and preprocessed. Training set size: {X_train.shape[0]}")
+                
+                # Create graph data
+                train_data = create_graph_data(X_train, y_train).to(device)
+                test_data = create_graph_data(X_test, y_test).to(device)
+                logger.info(f"Graph data created. Number of nodes: {train_data.num_nodes}, Number of edges: {train_data.num_edges}")
+                
+                # Train teacher model
+                teacher_model = train_teacher_model(teacher_model, train_data, device, epochs=100)
+                
+                # Train student model with knowledge distillation
+                student_model = train_student_with_distillation(teacher_model, student_model, train_data, device, epochs=100)
+                
+                # Save models and metadata
+                torch.save(teacher_model.state_dict(), teacher_model_path)
+                torch.save(student_model.state_dict(), student_model_path)
+                torch.save({
+                    "scaler": scaler,
+                    "feature_cols": feature_cols,
+                    "kmeans_model": kmeans_model
+                }, "model_metadata.pt")
+                logger.info("Models and metadata saved successfully")
+            except Exception as train_error:
+                logger.error(f"Error during model training: {train_error}")
+                # Continue with untrained models
+        
+        # Validate that models are loaded and ready
+        if student_model is not None and hasattr(student_model, 'conv1'):
+            logger.info("API startup completed successfully - model ready for predictions")
+        else:
+            logger.warning("API startup completed but models may not be initialized correctly")
     
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         # Continue running the application even if model training fails
-
 @app.get("/")
 async def root():
     return {"message": "ECF Prediction API with Knowledge Distillation", "status": "active"}
@@ -309,6 +348,11 @@ async def health_check():
 @app.post("/predict/")
 async def predict(data: PredictionRequest):
     try:
+        # Log the received data for debugging
+        logger.info(f"Received prediction request with features: {data.features}")
+        if len(data.edges) > 0:
+            logger.info(f"Custom edges provided: {data.edges}")
+        
         # Get the input features - expect exactly 4 features (tick, cape, cattle, bio5)
         features = data.features
         
@@ -316,22 +360,42 @@ async def predict(data: PredictionRequest):
             logger.warning(f"Expected 4 features but received {len(features)}. Please provide [tick, cape, cattle, bio5]")
             raise HTTPException(status_code=400, detail="Expected 4 features: [tick, cape, cattle, bio5]")
         
+        # Check if models are loaded correctly
+        if student_model is None:
+            logger.error("Student model not loaded. Please check if training completed successfully.")
+            raise HTTPException(status_code=500, detail="Model not loaded. Server needs restarting.")
+        
         # Apply clustering to get the 5th feature (cluster)
-        if kmeans_model is not None:
-            cluster = kmeans_model.predict([features])[0]
-            features_with_cluster = features + [cluster]
-        else:
-            # If no kmeans model, use a default cluster (0)
+        try:
+            if kmeans_model is not None:
+                cluster = kmeans_model.predict([features])[0]
+                logger.info(f"KMeans assigned cluster: {cluster}")
+                features_with_cluster = features + [cluster]
+            else:
+                # If no kmeans model, use a default cluster (0)
+                logger.warning("KMeans model not available. Using default cluster 0.")
+                features_with_cluster = features + [0]
+        except Exception as cluster_error:
+            logger.error(f"Error during clustering: {cluster_error}")
+            # Continue with default cluster as fallback
             features_with_cluster = features + [0]
         
         # Apply scaling if scaler is available
-        if scaler is not None:
-            features_scaled = scaler.transform([features_with_cluster])[0]
-        else:
+        try:
+            if scaler is not None:
+                features_scaled = scaler.transform([features_with_cluster])[0]
+                logger.info(f"Features after scaling: {features_scaled}")
+            else:
+                features_scaled = features_with_cluster
+                logger.warning("Scaler not available. Using unscaled features.")
+        except Exception as scale_error:
+            logger.error(f"Error during feature scaling: {scale_error}")
+            # Continue with unscaled features as fallback
             features_scaled = features_with_cluster
             
         # Convert input to tensor
         X = torch.tensor([features_scaled], dtype=torch.float).to(device)
+        logger.info(f"Input tensor shape: {X.shape}")
         
         # Create edge structure - either use provided edges or create a self-loop
         if data.edges and len(data.edges) > 0:
@@ -342,21 +406,42 @@ async def predict(data: PredictionRequest):
             # Create self-loop for the single node
             edge_list = torch.tensor([[0], [0]], dtype=torch.long).to(device)
         
+        logger.info(f"Edge list shape: {edge_list.shape}")
+        
         # Make prediction with student model (smaller and faster)
         student_model.eval()
-        with torch.no_grad():
-            student_output = student_model(X, edge_list)
-            student_probabilities = torch.exp(student_output).detach().cpu().numpy()[0]
-            student_prediction = student_output.argmax(dim=1).item()
+        try:
+            with torch.no_grad():
+                student_output = student_model(X, edge_list)
+                student_probabilities = torch.exp(student_output).cpu().numpy()[0]
+                student_prediction = student_output.argmax(dim=1).item()
+            
+            logger.info(f"Student model prediction: {student_prediction}")
+            logger.info(f"Student model probabilities: {student_probabilities}")
+        except Exception as student_error:
+            logger.error(f"Error during student model prediction: {student_error}")
+            raise HTTPException(status_code=500, detail=f"Student model prediction failed: {str(student_error)}")
         
         # Also get teacher prediction for comparison
-        teacher_model.eval()
-        with torch.no_grad():
-            teacher_output = teacher_model(X, edge_list)
-            teacher_probabilities = torch.exp(teacher_output).detach().cpu().numpy()[0]
-            teacher_prediction = teacher_output.argmax(dim=1).item()
+        teacher_prediction = None
+        teacher_probabilities = [0, 0]
         
-        return {
+        if teacher_model is not None:
+            try:
+                teacher_model.eval()
+                with torch.no_grad():
+                    teacher_output = teacher_model(X, edge_list)
+                    teacher_probabilities = torch.exp(teacher_output).cpu().numpy()[0]
+                    teacher_prediction = teacher_output.argmax(dim=1).item()
+                logger.info(f"Teacher model prediction: {teacher_prediction}")
+            except Exception as teacher_error:
+                logger.error(f"Error during teacher model prediction: {teacher_error}")
+                # Continue without teacher prediction
+        else:
+            logger.warning("Teacher model not available")
+        
+        # Construct response
+        response = {
             "prediction": int(student_prediction),  # 0 or 1
             "probability": float(student_probabilities[student_prediction]),
             "risk_level": "High" if student_prediction == 1 else "Low",
@@ -365,15 +450,25 @@ async def predict(data: PredictionRequest):
                 "high_risk": float(student_probabilities[1])
             },
             "cluster": int(features_with_cluster[4]),
-            "teacher_prediction": int(teacher_prediction),
-            "teacher_probabilities": {
-                "low_risk": float(teacher_probabilities[0]),
-                "high_risk": float(teacher_probabilities[1])
-            }
         }
+        
+        # Add teacher predictions if available
+        if teacher_prediction is not None:
+            response.update({
+                "teacher_prediction": int(teacher_prediction),
+                "teacher_probabilities": {
+                    "low_risk": float(teacher_probabilities[0]),
+                    "high_risk": float(teacher_probabilities[1])
+                }
+            })
+        
+        logger.info(f"Returning prediction response: {response}")
+        return response
+        
     except Exception as e:
         logger.error(f"Prediction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return more descriptive error
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 @app.get("/model-info/")
 async def model_info():
