@@ -346,14 +346,14 @@ async def predict(data: PredictionRequest):
         student_model.eval()
         with torch.no_grad():
             student_output = student_model(X, edge_list)
-            student_probabilities = torch.exp(student_output).cpu().numpy()[0]
+            student_probabilities = torch.exp(student_output).detach().cpu().numpy()[0]
             student_prediction = student_output.argmax(dim=1).item()
         
         # Also get teacher prediction for comparison
         teacher_model.eval()
         with torch.no_grad():
             teacher_output = teacher_model(X, edge_list)
-            teacher_probabilities = torch.exp(teacher_output).cpu().numpy()[0]
+            teacher_probabilities = torch.exp(teacher_output).detach().cpu().numpy()[0]
             teacher_prediction = teacher_output.argmax(dim=1).item()
         
         return {
