@@ -302,6 +302,7 @@ async def root():
 
 @app.post("/predict/")
 async def predict(data: PredictionRequest):
+    logger.info("Prediction endpoint called")
     try:
         # Get the input features
         features = data.features
@@ -413,6 +414,5 @@ async def get_metrics():
         logger.error(f"Error calculating metrics: {e}")
         return {"status": "Error calculating metrics", "error": str(e)}
 
-# Run locally for testing
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
